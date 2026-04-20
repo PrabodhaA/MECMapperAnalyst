@@ -5,12 +5,11 @@
       "samplingSettings": {
         "isEnabled": true,
         "excludedTypes": "Request"
-      }
-    }
-  },
-  "extensions": {
-    "http": {
-      "routePrefix": "api"
+      },
+      "enableLiveMetrics": false
+    },
+    "logLevel": {
+      "default": "Warning"
     }
   }
 }
