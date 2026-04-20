@@ -3,10 +3,246 @@ using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 using Anthropic.SDK;
-using Anthropic.SDK.Messaging;
+using Anthropic.SDK.Models;
 using Microsoft.Azure.Functions.Worker;
 using Microsoft.Azure.Functions.Worker.Http;
 using Microsoft.Extensions.Logging;
+
+namespace MapAnalystFunction;
+
+public class AnalyseFunction
+{
+    private readonly ILogger<AnalyseFunction> _logger;
+    private readonly string _skillContent;
+    private readonly string _apiKey;
+
+    public AnalyseFunction(ILogger<AnalyseFunction> logger)
+    {
+        _logger = logger;
+
+        var skillPath = Path.Combine(AppContext.BaseDirectory, "Skills", "mec-map-analyst.md");
+        _skillContent = File.Exists(skillPath)
+            ? File.ReadAllText(skillPath)
+            : "You are a helpful MEC map analyst.";
+
+        _apiKey = Environment.GetEnvironmentVariable("ANTHROPIC_API_KEY")
+            ?? throw new InvalidOperationException("ANTHROPIC_API_KEY is not set.");
+    }
+
+    [Function("Chat")]
+    public async Task<HttpResponseData> Chat(
+        [HttpTrigger(AuthorizationLevel.Anonymous, "post", Route = "chat")] HttpRequestData req)
+    {
+        ChatRequest? chatRequest = null;
+        string? mapXml = null;
+
+        var contentType = req.Headers.TryGetValues("Content-Type", out var ctValues)
+            ? ctValues.FirstOrDefault() ?? ""
+            : "";
+
+        if (contentType.Contains("multipart/form-data"))
+        {
+            var form = await ParseMultipartFormAsync(req);
+            mapXml = form.MapXml;
+            var requestJson = form.RequestJson;
+            if (!string.IsNullOrWhiteSpace(requestJson))
+                chatRequest = JsonSerializer.Deserialize<ChatRequest>(requestJson, JsonOptions);
+        }
+        else
+        {
+            var body = await req.ReadAsStringAsync();
+            chatRequest = JsonSerializer.Deserialize<ChatRequest>(body ?? "", JsonOptions);
+        }
+
+        if (chatRequest is null)
+            return await ErrorResponse(req, "Invalid request body.", HttpStatusCode.BadRequest);
+
+        if (string.IsNullOrWhiteSpace(chatRequest.Message))
+            return await ErrorResponse(req, "Message is required.", HttpStatusCode.BadRequest);
+
+        // Build messages list
+        var messages = new List<Message>();
+
+        if (!string.IsNullOrWhiteSpace(mapXml))
+        {
+            var processedXml = TruncateMapXml(mapXml);
+            messages.Add(new Message(
+                RoleType.User,
+                $"I am uploading a MEC mapper XML file for analysis.\n\n<mapper_xml>\n{processedXml}\n</mapper_xml>\n\nPlease confirm you have received the map and tell me the map name, version, and in one sentence what it does. Then wait for my questions."
+            ));
+            messages.Add(new Message(
+                RoleType.Assistant,
+                chatRequest.MapSummary ?? "Map received. I have parsed the mapper XML and am ready to answer your questions."
+            ));
+        }
+
+        if (chatRequest.History is { Count: > 0 })
+        {
+            foreach (var turn in chatRequest.History)
+            {
+                messages.Add(new Message(
+                    turn.Role == "user" ? RoleType.User : RoleType.Assistant,
+                    turn.Content
+                ));
+            }
+        }
+
+        messages.Add(new Message(RoleType.User, chatRequest.Message));
+
+        try
+        {
+            var client = new AnthropicClient(_apiKey);
+            var request = new MessageRequest
+            {
+                Model = "claude-sonnet-4-5-20251001",
+                MaxTokens = 2048,
+                System = _skillContent,
+                Messages = messages
+            };
+
+            var response = await client.Messages.GetClaudeMessageAsync(request);
+            var replyText = response.Content.OfType<TextContent>().FirstOrDefault()?.Text ?? "";
+
+            var result = new ChatResponse
+            {
+                Reply = replyText,
+                InputTokens = response.Usage?.InputTokens ?? 0,
+                OutputTokens = response.Usage?.OutputTokens ?? 0
+            };
+
+            return await JsonResponse(req, result);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Claude API call failed");
+            return await ErrorResponse(req, $"Failed to get response from Claude API: {ex.Message}", HttpStatusCode.InternalServerError);
+        }
+    }
+
+    [Function("Health")]
+    public async Task<HttpResponseData> Health(
+        [HttpTrigger(AuthorizationLevel.Anonymous, "get", Route = "health")] HttpRequestData req)
+    {
+        var result = new { status = "ok", skill = "mec-map-analyst", version = "1.0" };
+        return await JsonResponse(req, result);
+    }
+
+    private static string TruncateMapXml(string xml)
+    {
+        xml = RemoveXmlSection(xml, "Links");
+        xml = RemoveXmlSection(xml, "SchemaOut");
+        if (xml.Length > 80000)
+            xml = xml[..80000] + "\n<!-- [truncated for size] -->";
+        return xml;
+    }
+
+    private static string RemoveXmlSection(string xml, string tagName)
+    {
+        var start = xml.IndexOf($"<{tagName}>", StringComparison.OrdinalIgnoreCase);
+        var end = xml.IndexOf($"</{tagName}>", StringComparison.OrdinalIgnoreCase);
+        if (start >= 0 && end >= 0)
+            xml = xml[..start] + xml[(end + tagName.Length + 3)..];
+        return xml;
+    }
+
+    private static async Task<(string? MapXml, string? RequestJson)> ParseMultipartFormAsync(HttpRequestData req)
+    {
+        string? mapXml = null;
+        string? requestJson = null;
+
+        try
+        {
+            // Read body as stream
+            using var ms = new MemoryStream();
+            await req.Body.CopyToAsync(ms);
+            var bodyBytes = ms.ToArray();
+            var bodyText = Encoding.UTF8.GetString(bodyBytes);
+
+            var contentType = req.Headers.TryGetValues("Content-Type", out var ct) ? ct.FirstOrDefault() ?? "" : "";
+            var boundaryIndex = contentType.IndexOf("boundary=", StringComparison.OrdinalIgnoreCase);
+            if (boundaryIndex < 0) return (null, null);
+            var boundary = "--" + contentType[(boundaryIndex + 9)..].Trim();
+
+            var parts = bodyText.Split(boundary, StringSplitOptions.RemoveEmptyEntries);
+            foreach (var part in parts)
+            {
+                if (part.Contains("name=\"mapFile\""))
+                {
+                    var contentStart = part.IndexOf("\r\n\r\n", StringComparison.Ordinal);
+                    if (contentStart >= 0)
+                        mapXml = part[(contentStart + 4)..].TrimEnd('\r', '\n', '-');
+                }
+                else if (part.Contains("name=\"request\""))
+                {
+                    var contentStart = part.IndexOf("\r\n\r\n", StringComparison.Ordinal);
+                    if (contentStart >= 0)
+                        requestJson = part[(contentStart + 4)..].TrimEnd('\r', '\n', '-');
+                }
+            }
+        }
+        catch (Exception) { }
+
+        return (mapXml, requestJson);
+    }
+
+    private static readonly JsonSerializerOptions JsonOptions = new()
+    {
+        PropertyNameCaseInsensitive = true,
+        DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull
+    };
+
+    private static async Task<HttpResponseData> JsonResponse<T>(HttpRequestData req, T data)
+    {
+        var response = req.CreateResponse(HttpStatusCode.OK);
+        response.Headers.Add("Content-Type", "application/json; charset=utf-8");
+        response.Headers.Add("Access-Control-Allow-Origin", "*");
+        await response.WriteStringAsync(JsonSerializer.Serialize(data, JsonOptions));
+        return response;
+    }
+
+    private static async Task<HttpResponseData> ErrorResponse(HttpRequestData req, string message, HttpStatusCode status)
+    {
+        var response = req.CreateResponse(status);
+        response.Headers.Add("Content-Type", "application/json; charset=utf-8");
+        response.Headers.Add("Access-Control-Allow-Origin", "*");
+        await response.WriteStringAsync(JsonSerializer.Serialize(new { error = message }));
+        return response;
+    }
+}
+
+public class CorsFunction
+{
+    [Function("CorsOptions")]
+    public HttpResponseData Options(
+        [HttpTrigger(AuthorizationLevel.Anonymous, "options", Route = "{*any}")] HttpRequestData req)
+    {
+        var response = req.CreateResponse(HttpStatusCode.OK);
+        response.Headers.Add("Access-Control-Allow-Origin", "*");
+        response.Headers.Add("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+        response.Headers.Add("Access-Control-Allow-Headers", "Content-Type, Authorization");
+        return response;
+    }
+}
+
+public class ChatRequest
+{
+    public string Message { get; set; } = "";
+    public string? MapSummary { get; set; }
+    public List<ConversationTurn>? History { get; set; }
+}
+
+public class ConversationTurn
+{
+    public string Role { get; set; } = "";
+    public string Content { get; set; } = "";
+}
+
+public class ChatResponse
+{
+    public string Reply { get; set; } = "";
+    public int InputTokens { get; set; }
+    public int OutputTokens { get; set; }
+}
 
 namespace MapAnalystFunction;
 
